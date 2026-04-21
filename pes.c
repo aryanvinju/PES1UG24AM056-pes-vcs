@@ -11,6 +11,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(path, mode) _mkdir(path)
+#endif
+
 // ─── PROVIDED: Command Implementations ──────────────────────────────────────
 
 // Usage: pes init
@@ -29,6 +34,15 @@ void cmd_init(void) {
             fprintf(f, "ref: refs/heads/main\n");
             fclose(f);
         }
+    }
+
+    if (access(INDEX_FILE, F_OK) != 0) {
+        FILE *f = fopen(INDEX_FILE, "w");
+        if (!f) {
+            fprintf(stderr, "error: failed to create %s\n", INDEX_FILE);
+            return;
+        }
+        fclose(f);
     }
 
     printf("Initialized empty PES repository in %s/\n", PES_DIR);

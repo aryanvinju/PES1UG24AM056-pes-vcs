@@ -13,16 +13,111 @@
 // what will go into the next commit) and ATOMIC WRITES (temp+rename).
 //
 // PROVIDED functions: index_find, index_remove, index_status
-// TODO functions:     index_load, index_save, index_add
 
 #include "index.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <errno.h>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#include <windows.h>
+#define fsync _commit
+#define lstat stat
+#define mkdir(path, mode) _mkdir(path)
+#endif
+
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+uint32_t get_file_mode(const char *path);
+
+static int compare_index_entries(const void *a, const void *b) {
+    return strcmp(((const IndexEntry *)a)->path, ((const IndexEntry *)b)->path);
+}
+
+static int ensure_index_parent_dir(void) {
+    if (mkdir(PES_DIR, 0755) != 0 && errno != EEXIST)
+        return -1;
+    return 0;
+}
+
+static int path_is_tracked(const Index *index, const char *path) {
+    for (int i = 0; i < index->count; i++) {
+        if (strcmp(index->entries[i].path, path) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int should_skip_untracked_name(const char *name) {
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 1;
+    if (strcmp(name, ".pes") == 0) return 1;
+    if (strcmp(name, "pes") == 0 || strcmp(name, "pes.exe") == 0) return 1;
+    if (strcmp(name, "test_objects") == 0 || strcmp(name, "test_objects.exe") == 0) return 1;
+    if (strcmp(name, "test_tree") == 0 || strcmp(name, "test_tree.exe") == 0) return 1;
+    return strstr(name, ".o") != NULL;
+}
+
+static int print_untracked_recursive(const Index *index, const char *dir_path, const char *prefix) {
+    DIR *dir = opendir(dir_path);
+    if (!dir)
+        return 0;
+
+    int untracked_count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (should_skip_untracked_name(ent->d_name))
+            continue;
+
+        char rel_path[1024];
+        if (prefix[0] == '\0')
+            snprintf(rel_path, sizeof(rel_path), "%s", ent->d_name);
+        else
+            snprintf(rel_path, sizeof(rel_path), "%s/%s", prefix, ent->d_name);
+
+        char full_path[1024];
+        if (strcmp(dir_path, ".") == 0)
+            snprintf(full_path, sizeof(full_path), "%s", ent->d_name);
+        else
+            snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
+
+        struct stat st;
+        if (lstat(full_path, &st) != 0)
+            continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            untracked_count += print_untracked_recursive(index, full_path, rel_path);
+            continue;
+        }
+
+        if (!S_ISREG(st.st_mode))
+            continue;
+
+        if (!path_is_tracked(index, rel_path)) {
+            printf("  untracked:  %s\n", rel_path);
+            untracked_count++;
+        }
+    }
+
+    closedir(dir);
+    return untracked_count;
+}
+
+// Windows rename semantics differ from POSIX, so use a helper that
+// preserves the "replace existing file" behavior expected by the lab.
+static int replace_path(const char *src, const char *dst) {
+#ifdef _WIN32
+    return MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
+#else
+    return rename(src, dst);
+#endif
+}
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
@@ -88,37 +183,7 @@ int index_status(const Index *index) {
     printf("\n");
 
     printf("Untracked files:\n");
-    int untracked_count = 0;
-    DIR *dir = opendir(".");
-    if (dir) {
-        struct dirent *ent;
-        while ((ent = readdir(dir)) != NULL) {
-            // Skip hidden directories, parent directories, and build artifacts
-            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-            if (strcmp(ent->d_name, ".pes") == 0) continue;
-            if (strcmp(ent->d_name, "pes") == 0) continue; // compiled executable
-            if (strstr(ent->d_name, ".o") != NULL) continue; // object files
-
-            // Check if file is tracked in the index
-            int is_tracked = 0;
-            for (int i = 0; i < index->count; i++) {
-                if (strcmp(index->entries[i].path, ent->d_name) == 0) {
-                    is_tracked = 1; 
-                    break;
-                }
-            }
-            
-            if (!is_tracked) {
-                struct stat st;
-                stat(ent->d_name, &st);
-                if (S_ISREG(st.st_mode)) { // Only list regular files for simplicity
-                    printf("  untracked:  %s\n", ent->d_name);
-                    untracked_count++;
-                }
-            }
-        }
-        closedir(dir);
-    }
+    int untracked_count = print_untracked_recursive(index, ".", "");
     if (untracked_count == 0) printf("  (nothing to show)\n");
     printf("\n");
 
@@ -135,10 +200,30 @@ int index_status(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    index->count = 0;
+
+    FILE *f = fopen(INDEX_FILE, "r");
+    if (!f)
+        return errno == ENOENT ? 0 : -1;
+
+    char hash_hex[HASH_HEX_SIZE + 1];
+    IndexEntry entry;
+    while (fscanf(f, "%o %64s %" SCNu64 " %u %511[^\n]\n",
+                  &entry.mode, hash_hex, &entry.mtime_sec, &entry.size, entry.path) == 5) {
+        if (index->count >= MAX_INDEX_ENTRIES || hex_to_hash(hash_hex, &entry.hash) != 0) {
+            fclose(f);
+            return -1;
+        }
+        index->entries[index->count++] = entry;
+    }
+
+    if (!feof(f)) {
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+    return 0;
 }
 
 // Save the index to .pes/index atomically.
@@ -152,9 +237,59 @@ int index_load(Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
+    Index *sorted = malloc(sizeof(Index));
+    if (!sorted)
+        return -1;
+    *sorted = *index;
+    qsort(sorted->entries, sorted->count, sizeof(IndexEntry), compare_index_entries);
+
+    if (ensure_index_parent_dir() != 0)
+        goto fail;
+
+    const char *tmp_path = INDEX_FILE ".tmp";
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) goto fail;
+
+    for (int i = 0; i < sorted->count; i++) {
+        char hash_hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&sorted->entries[i].hash, hash_hex);
+        if (fprintf(f, "%o %s %" PRIu64 " %u %s\n",
+                    sorted->entries[i].mode, hash_hex, sorted->entries[i].mtime_sec,
+                    sorted->entries[i].size, sorted->entries[i].path) < 0) {
+            fclose(f);
+            unlink(tmp_path);
+            goto fail;
+        }
+    }
+
+    fflush(f);
+    if (fsync(fileno(f)) != 0) {
+        fclose(f);
+        unlink(tmp_path);
+        goto fail;
+    }
+
+    if (fclose(f) != 0) {
+        unlink(tmp_path);
+        goto fail;
+    }
+
+    if (replace_path(tmp_path, INDEX_FILE) != 0) {
+        unlink(tmp_path);
+        goto fail;
+    }
+
+    int dir_fd = open(PES_DIR, O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
+    free(sorted);
+    return 0;
+
+fail:
+    free(sorted);
     return -1;
 }
 
@@ -168,8 +303,44 @@ int index_save(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    uint8_t *data = malloc((size_t)st.st_size ? (size_t)st.st_size : 1);
+    if (!data) {
+        fclose(f);
+        return -1;
+    }
+
+    if (st.st_size > 0 && fread(data, 1, (size_t)st.st_size, f) != (size_t)st.st_size) {
+        free(data);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    ObjectID blob_id;
+    if (object_write(OBJ_BLOB, data, (size_t)st.st_size, &blob_id) != 0) {
+        free(data);
+        return -1;
+    }
+    free(data);
+
+    IndexEntry *entry = index_find(index, path);
+    if (!entry) {
+        if (index->count >= MAX_INDEX_ENTRIES) return -1;
+        entry = &index->entries[index->count++];
+    }
+
+    entry->mode = get_file_mode(path);
+    entry->hash = blob_id;
+    entry->mtime_sec = (uint64_t)st.st_mtime;
+    entry->size = (uint32_t)st.st_size;
+    if (snprintf(entry->path, sizeof(entry->path), "%s", path) >= (int)sizeof(entry->path))
+        return -1;
+
+    return index_save(index);
 }

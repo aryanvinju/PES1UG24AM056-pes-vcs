@@ -25,49 +25,73 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#define fsync _commit
+#endif
+
 // Forward declarations (implemented in object.c)
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out);
+
+static int replace_path(const char *src, const char *dst) {
+#ifdef _WIN32
+    return MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
+#else
+    return rename(src, dst);
+#endif
+}
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 // Parse raw commit data into a Commit struct.
 int commit_parse(const void *data, size_t len, Commit *commit_out) {
-    (void)len;
-    const char *p = (const char *)data;
+    const char *start = (const char *)data;
+    const char *end = start + len;
+    const char *p = start;
     char hex[HASH_HEX_SIZE + 1];
 
-    // "tree <hex>\n"
-    if (sscanf(p, "tree %64s\n", hex) != 1) return -1;
+    const char *line_end = memchr(p, '\n', (size_t)(end - p));
+    if (!line_end) return -1;
+    if (sscanf(p, "tree %64s", hex) != 1) return -1;
     if (hex_to_hash(hex, &commit_out->tree) != 0) return -1;
-    p = strchr(p, '\n') + 1;
+    p = line_end + 1;
 
-    // optional "parent <hex>\n"
     if (strncmp(p, "parent ", 7) == 0) {
-        if (sscanf(p, "parent %64s\n", hex) != 1) return -1;
+        line_end = memchr(p, '\n', (size_t)(end - p));
+        if (!line_end) return -1;
+        if (sscanf(p, "parent %64s", hex) != 1) return -1;
         if (hex_to_hash(hex, &commit_out->parent) != 0) return -1;
         commit_out->has_parent = 1;
-        p = strchr(p, '\n') + 1;
+        p = line_end + 1;
     } else {
         commit_out->has_parent = 0;
     }
 
-    // "author <name> <timestamp>\n"
     char author_buf[256];
     uint64_t ts;
-    if (sscanf(p, "author %255[^\n]\n", author_buf) != 1) return -1;
-    // split off trailing timestamp
+    line_end = memchr(p, '\n', (size_t)(end - p));
+    if (!line_end) return -1;
+    if (sscanf(p, "author %255[^\n]", author_buf) != 1) return -1;
     char *last_space = strrchr(author_buf, ' ');
     if (!last_space) return -1;
     ts = (uint64_t)strtoull(last_space + 1, NULL, 10);
     *last_space = '\0';
     snprintf(commit_out->author, sizeof(commit_out->author), "%s", author_buf);
     commit_out->timestamp = ts;
-    p = strchr(p, '\n') + 1;  // skip author line
-    p = strchr(p, '\n') + 1;  // skip committer line
-    p = strchr(p, '\n') + 1;  // skip blank line
+    p = line_end + 1;
 
-    snprintf(commit_out->message, sizeof(commit_out->message), "%s", p);
+    line_end = memchr(p, '\n', (size_t)(end - p));
+    if (!line_end) return -1;
+    if (strncmp(p, "committer ", 10) != 0) return -1;
+    p = line_end + 1;
+
+    if (p >= end || *p != '\n') return -1;
+    p++;
+
+    snprintf(commit_out->message, sizeof(commit_out->message), "%.*s",
+             (int)(end - p), p);
     return 0;
 }
 
@@ -111,6 +135,10 @@ int commit_walk(commit_walk_fn callback, void *ctx) {
         void *raw;
         size_t raw_len;
         if (object_read(&id, &type, &raw, &raw_len) != 0) return -1;
+        if (type != OBJ_COMMIT) {
+            free(raw);
+            return -1;
+        }
 
         Commit c;
         int rc = commit_parse(raw, raw_len, &c);
@@ -176,7 +204,7 @@ int head_update(const ObjectID *new_commit) {
     fsync(fileno(f));
     fclose(f);
     
-    return rename(tmp_path, target_path);
+    return replace_path(tmp_path, target_path);
 }
 
 // ─── TODO: Implement these ───────────────────────────────────────────────────
@@ -194,8 +222,29 @@ int head_update(const ObjectID *new_commit) {
 //
 // Returns 0 on success, -1 on error.
 int commit_create(const char *message, ObjectID *commit_id_out) {
-    // TODO: Implement commit creation
-    // (See Lab Appendix for logical steps)
-    (void)message; (void)commit_id_out;
-    return -1;
+    Commit commit = {0};
+    if (tree_from_index(&commit.tree) != 0) return -1;
+
+    if (head_read(&commit.parent) == 0) {
+        commit.has_parent = 1;
+    } else {
+        commit.has_parent = 0;
+    }
+
+    snprintf(commit.author, sizeof(commit.author), "%s", pes_author());
+    commit.timestamp = (uint64_t)time(NULL);
+    snprintf(commit.message, sizeof(commit.message), "%s", message);
+
+    void *raw = NULL;
+    size_t raw_len = 0;
+    if (commit_serialize(&commit, &raw, &raw_len) != 0) return -1;
+
+    ObjectID commit_id;
+    int rc = object_write(OBJ_COMMIT, raw, raw_len, &commit_id);
+    free(raw);
+    if (rc != 0) return -1;
+
+    if (head_update(&commit_id) != 0) return -1;
+    *commit_id_out = commit_id;
+    return 0;
 }
